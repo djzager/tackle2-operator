@@ -131,9 +131,21 @@ jobs:
           done
           docker image inspect quay.io/${{ matrix.projects.image }}:${{ inputs.version }}
 
+  test:
+    name: Test Konveyor
+    needs: release-components
+    uses: konveyor/ci/.github/workflows/global-ci-bundle.yml@main
+    with:
+      operator: quay.io/konveyor/tackle2-operator:${{ inputs.version }}
+      tackle_hub: quay.io/konveyor/tackle2-hub:${{ inputs.version }}
+      keycloack_init: quay.io/konveyor/tackle-keycloak-init:${{ inputs.version }}
+      tackle_ui: quay.io/konveyor/tackle2-ui:${{ inputs.version }}
+      addon_admin: quay.io/konveyor/tackle2-addon:${{ inputs.version }}
+      addon_analyzer: quay.io/konveyor/tackle2-addon-analyzer:${{ inputs.version }}
+
   publish:
     name: Build and Push Manifest
-    needs: release-components
+    needs: test
     runs-on: ubuntu-20.04
     strategy:
       fail-fast: false
@@ -142,6 +154,46 @@ jobs:
       uses: actions/checkout@v3
       with:
         ref: ${{ inputs.branch }}
+
+    - name: Mirror non-konveyor images
+      uses: 
+      run: |
+        make yq openshift-client
+
+        IMAGE_ORG="quay.io/konveyor"
+        VERSION="${{ inputs.version }}"
+        CSV="${__root}/bundle/manifests/konveyor-operator.clusterserviceversion.yaml"
+
+        for full_image in $(yq eval '.spec.relatedImages[] | .image' "${CSV}"); do
+            image="${full_image%:*}"
+            full_image_name="${image#*/}"
+            image_name="${full_image_name#*/}"
+            mirror_image_name="${IMAGE_ORG}/${image_name}:${VERSION}"
+
+            if ! [[ "${full_image}" =~ "${IMAGE_ORG}"/.* ]]; then
+                set -x
+                oc image mirror "${full_image}" "${mirror_image_name}" || {
+                    echo "ERROR unable to mirror image"
+                    exit 1
+                }
+            fi
+        done
+
+    - name: Build bundle
+      uses: ./.github/actions/make-bundle
+      with:
+        operator_bundle: ttl.sh/konveyor-operator-bundle-${github.sha}:3h
+        operator: quay.io/konveyor/tackle2-operator:${{ inputs.version }}
+        tackle_hub: quay.io/konveyor/tackle2-hub:${{ inputs.version }}
+        keycloack_init: quay.io/konveyor/tackle-keycloak-init:${{ inputs.version }}
+        tackle_ui: quay.io/konveyor/tackle2-ui:${{ inputs.version }}
+        addon_admin: quay.io/konveyor/tackle2-addon:${{ inputs.version }}
+        addon_analyzer: quay.io/konveyor/tackle2-addon-analyzer:${{ inputs.version }}
+        # The ones we don't own
+        tackle_postgres: quay.io/konveyor/postgresql-12-centos7:${{ inputs.version }}
+        keycloak_sso: quay.io/konveyor/keycloak:${{ inputs.version }}
+        # Make sure we use digests
+        use_image_digest: "true"
 
     - name: Run migrations
       run: bash ./tools/konveyor-operator-publish-commands.sh
