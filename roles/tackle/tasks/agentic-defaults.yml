@@ -36,12 +36,16 @@
   find:
     paths: "{{ role_path }}/templates/agentic/defaults"
     patterns: "*.yaml"
+    # The sync strips config/defaults/kustomization.yaml, but exclude it
+    # defensively: it is a Kustomize control file, not a CR, so it has no
+    # metadata.name and would break the apply and identity loops.
+    excludes: "kustomization.yaml"
     file_type: file
   register: agentic_defaults
 
 - name: Apply agentic controller default content
   k8s:
-    state: "{{ agentic_state }}"
+    state: present
     namespace: "{{ app_namespace }}"
     src: "{{ item }}"
     apply: true
@@ -51,11 +55,19 @@
   loop: "{{ agentic_defaults.files | map(attribute='path') | sort }}"
   loop_control:
     label: "{{ item | basename }}"
+  when: agentic_state == 'present'
 
-# --- Prune curated defaults removed from the catalog -------------------------
-# Only when the content is meant to be present; when agentic_state is absent the
-# apply loop above already deletes each shipped default, so there is nothing to
-# reconcile here.
+# --- Prune curated defaults not in the desired set ---------------------------
+# The prune, not the apply loop, owns all deletion, and it runs in BOTH states:
+#   - present: the desired set is the currently-synced catalog, so prune removes
+#     only defaults that a newer catalog dropped (orphans).
+#   - absent: the desired set is empty (the identity task below is skipped, so
+#     agentic_desired_defaults defaults to []), so prune removes every curated
+#     default -- disabling the feature must also clean up defaults that an older
+#     catalog installed but the current one no longer ships.
+# It is safe in both cases because it only ever lists and deletes objects
+# carrying the app.kubernetes.io/managed-by marker label; user-created
+# SkillCards/Agents never have it and are untouched.
 
 - name: Record the desired default identities (kind/name)
   set_fact:
@@ -81,9 +93,8 @@
     - AgentWorkflow
     - SkillCard
     - SkillCollection
-  when: agentic_state == 'present'
 
-- name: Prune curated defaults no longer in the catalog
+- name: Prune curated defaults no longer in the desired set
   k8s:
     state: absent
     api_version: konveyor.io/v1alpha1
@@ -94,6 +105,4 @@
             | map(attribute='resources') | flatten }}"
   loop_control:
     label: "{{ item.kind }}/{{ item.metadata.name }}"
-  when:
-    - agentic_state == 'present'
-    - (item.kind ~ '/' ~ item.metadata.name) not in (agentic_desired_defaults | default([]))
+  when: (item.kind ~ '/' ~ item.metadata.name) not in (agentic_desired_defaults | default([]))
